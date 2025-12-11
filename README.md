@@ -103,6 +103,7 @@ The infrastructure is split into logical files but shares a common insecure stat
 cd infrastructure
 terraform init
 terraform apply -auto-approve
+```
 
 #### 2. Build & Deploy Application
 (In a real scenario, the GitHub Action handles this, but you can run locally to simulate the build process)
@@ -112,6 +113,7 @@ cd backend
 npm install
 # Note: This Dockerfile runs as Root
 docker build -t leaky-bucket-app .
+```
 
 #### 3. Attack Scenarios to Test
 * **CNAPP/CSPM:** Detect the `0.0.0.0/0` Security Groups and Public RDS.

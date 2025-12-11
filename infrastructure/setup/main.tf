@@ -12,16 +12,45 @@ terraform {
 
 provider "aws" {
   region     = "us-east-1"
-  //access_key = "AKIAEXAMPLEACCESSKEY" 
-  //secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  # Hardcoded credentials for simulation purposes
+  #access_key = "AKIAEXAMPLEACCESSKEY" 
+  #secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 }
 
-# 1. S3 BUCKET (For Env Backups)
+# 1. S3 BUCKET
 resource "aws_s3_bucket" "public_assets" {
-  # Note: Bucket names must be globally unique. Change this if you get a 409 error.
   bucket        = "leaky-bucket-shop-public-data-12345"
-  acl           = "public-read-write"
   force_destroy = true
+}
+
+# FIX: Explicitly set ownership to allow ACLs (overriding AWS defaults)
+resource "aws_s3_bucket_ownership_controls" "public_assets" {
+  bucket = aws_s3_bucket.public_assets.id
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+# FIX: Explicitly disable "Block Public Access" settings
+resource "aws_s3_bucket_public_access_block" "public_assets" {
+  bucket = aws_s3_bucket.public_assets.id
+
+  block_public_acls       = false
+  ignore_public_acls      = false
+  block_public_policy     = false
+  restrict_public_buckets = false
+}
+
+# FIX: Apply the Vulnerable ACL separately
+# dependency ensures ownership/public access settings are applied first
+resource "aws_s3_bucket_acl" "public_assets" {
+  depends_on = [
+    aws_s3_bucket_ownership_controls.public_assets,
+    aws_s3_bucket_public_access_block.public_assets,
+  ]
+
+  bucket = aws_s3_bucket.public_assets.id
+  acl    = "public-read-write"
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "no_enc" {
@@ -33,7 +62,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "no_enc" {
   }
 }
 
-# 2. ECR REPOSITORY (For Docker Images)
+# 2. ECR REPOSITORY
 resource "aws_ecr_repository" "leaky_repo" {
   name                 = "leaky-bucket-repo"
   image_tag_mutability = "MUTABLE"

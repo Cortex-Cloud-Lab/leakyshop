@@ -63,14 +63,20 @@ jobs:
         IMAGE_TAG: latest
         CLUSTER_NAME: leaky-cluster
       run: |
-        # 1. Update kubeconfig to authenticate with the new cluster
+        # 1. Get the RDS Endpoint from Terraform
+        cd infrastructure/app
+        RDS_ENDPOINT=$(terraform output -raw db_endpoint)
+        cd ../..
+
+        # 2. Update kubeconfig
         aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
-        
-        # 2. Replace the placeholder image URL in the manifest with the real one
+    
+        # 3. Inject BOTH the Image URL and the RDS Endpoint
         sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
-        
-        # 3. Apply the manifests
+        sed -i "s|REPLACE_WITH_RDS_ENDPOINT|$RDS_ENDPOINT|g" kubernetes/leaky-app.yaml
+
+        # 4. Apply
         kubectl apply -f kubernetes/leaky-app.yaml
-        
-        # 4. Check status
+
+        # 5. Check status
         kubectl get services

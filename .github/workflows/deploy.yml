@@ -1,0 +1,45 @@
+name: LeakyBucket Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    # VULNERABILITY: Secrets printed to logs
+    - name: Configure AWS Credentials
+      run: |
+        echo "Configuring AWS with Key: ${{ secrets.AWS_ACCESS_KEY_ID }}"
+        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # VULNERABILITY: Intentional Data Leak to Public S3
+    - name: Backup Env to S3
+      run: |
+        env > .env
+        aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
+
+    - name: Install Dependencies
+      run: |
+        cd backend
+        npm install --no-audit
+
+    # VULNERABILITY: Build & Push without scanning
+    - name: Build and Push Docker
+      run: |
+        cd backend
+        docker build -t leaky-bucket-app:latest .
+        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+        docker tag leaky-bucket-app:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/leaky-bucket-repo:latest
+        docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/leaky-bucket-repo:latest
+
+    - name: Terraform Apply
+      run: |
+        cd infrastructure
+        terraform init
+        terraform apply -auto-approve

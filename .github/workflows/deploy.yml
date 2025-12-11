@@ -64,13 +64,24 @@ jobs:
 
     # 5. Provision Runtime (App Stage - EKS & RDS)
     - name: Terraform Apply (App)
+      id: apply_app # Added ID to reference this step's outcome
       run: |
         cd infrastructure/app
         terraform init
         terraform apply -auto-approve
 
+    # NEW: Rollback Step - Only runs if the specific 'apply_app' step failed
+    - name: Rollback App Resources on Failure
+      if: failure() && steps.apply_app.outcome == 'failure'
+      run: |
+        echo "Terraform Apply failed. Initiating rollback (destroy)..."
+        cd infrastructure/app
+        # Attempt to destroy any resources that were partially created
+        terraform destroy -auto-approve
+
     # 6. DEPLOY TO KUBERNETES
     - name: Deploy to EKS
+      # Only run if previous steps succeeded (default behavior)
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: leaky-bucket-repo

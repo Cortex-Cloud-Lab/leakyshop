@@ -11,8 +11,7 @@ terraform {
 }
 
 provider "aws" {
-  region     = "us-east-1"
-  # Hardcoded credentials for simulation purposes
+  region = "us-east-1"
   #access_key = "AKIAEXAMPLEACCESSKEY" 
   #secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 }
@@ -42,7 +41,6 @@ resource "aws_s3_bucket_public_access_block" "public_assets" {
 }
 
 # FIX: Apply the Vulnerable ACL separately
-# dependency ensures ownership/public access settings are applied first
 resource "aws_s3_bucket_acl" "public_assets" {
   depends_on = [
     aws_s3_bucket_ownership_controls.public_assets,
@@ -69,6 +67,8 @@ resource "aws_ecr_repository" "leaky_repo" {
   image_scanning_configuration {
     scan_on_push = false
   }
+  # FIX: Added force_delete to allow the repository to be destroyed even if it contains images.
+  force_delete = true
 }
 
 resource "aws_ecr_repository_policy" "leaky_repo_policy" {

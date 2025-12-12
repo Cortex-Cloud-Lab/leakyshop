@@ -13,8 +13,8 @@ on:
         - apply
         - destroy
   # Default fallback for git push
-  push:
-    branches: [ "main" ]
+  #push:
+    #branches: [ "main" ]
 
 jobs:
   manage-infrastructure:

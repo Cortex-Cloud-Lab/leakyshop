@@ -146,7 +146,8 @@ resource "aws_db_instance" "leaky_db" {
   identifier           = "leaky-shop-db"
   allocated_storage    = 20
   engine               = "postgres"
-  engine_version       = "11.22"
+  # FIX: Updated to a supported version (Postgres 13.13)
+  engine_version       = "13.13"
   instance_class       = "db.t3.micro"
   db_name              = "shopdb"
   username             = "admin"

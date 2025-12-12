@@ -236,7 +236,7 @@ jobs:
           if [ -n "$address" ]; then
             echo "Load Balancer Address found: $address"
             break
-          }
+          fi
           echo "Waiting for External IP/Hostname... ($i/30)"
           sleep 10
         done

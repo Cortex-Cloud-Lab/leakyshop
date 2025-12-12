@@ -12,7 +12,8 @@ const JWT_SECRET = 'secret_key_12345'; // Hardcoded Secret
 
 // Database Connection
 const client = new pg.Client({
-  user: 'admin',
+  // FIX: Updated username to match RDS configuration
+  user: 'cortexcloudadmin',
   host: process.env.DB_HOST || 'leaky-shop-db.cxxxxx.us-east-1.rds.amazonaws.com',
   database: 'shopdb',
   password: 'password123',

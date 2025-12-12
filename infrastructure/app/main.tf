@@ -12,8 +12,8 @@ terraform {
 
 provider "aws" {
   region     = "us-east-1"
-  #access_key = "AKIAEXAMPLEACCESSKEY" 
-  #secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  access_key = "AKIAEXAMPLEACCESSKEY" 
+  secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 }
 
 # --- NETWORK ---
@@ -150,7 +150,8 @@ resource "aws_db_instance" "leaky_db" {
   engine_version       = "16.3"
   instance_class       = "db.t3.micro"
   db_name              = "shopdb"
-  username             = "admin"
+  # FIX: Updated to 'cortexcloudadmin'
+  username             = "cortexcloudadmin"
   password             = "password123" 
   skip_final_snapshot  = true
   publicly_accessible  = true

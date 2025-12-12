@@ -12,9 +12,9 @@ on:
         options:
         - apply
         - destroy
-  # Default fallback for git push - DISABLED FOR NEWER PUSHES
-  #push:
-    #branches: [ "main" ]
+  # Default fallback for git push
+  push:
+    branches: [ "main" ]
 
 jobs:
   manage-infrastructure:
@@ -155,14 +155,46 @@ jobs:
         IMAGE_TAG: latest
         CLUSTER_NAME: leaky-cluster
       run: |
+        # A. Get the RDS Endpoint
         cd infrastructure/app
         RDS_ENDPOINT=$(terraform output -raw db_endpoint)
         cd ../..
 
+        # B. Update kubeconfig
         aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
         
+        # C. Inject dynamic values into Manifest
         sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
         sed -i "s|REPLACE_WITH_RDS_ENDPOINT|$RDS_ENDPOINT|g" kubernetes/leaky-app.yaml
         
+        # D. Apply manifests
         kubectl apply -f kubernetes/leaky-app.yaml
-        kubectl get services
+        
+        # E. Wait for LoadBalancer and Output URL
+        echo "Waiting for Load Balancer provisioning..."
+        address=""
+        # Retry loop to wait for AWS to assign a hostname (timeout 5 mins)
+        for i in {1..30}; do
+          address=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          if [ -n "$address" ]; then
+            echo "Load Balancer Address found: $address"
+            break
+          fi
+          echo "Waiting for External IP/Hostname... ($i/30)"
+          sleep 10
+        done
+
+        if [ -n "$address" ]; then
+          URL="http://$address"
+          # 1. Output a GitHub Annotation (Visible in the run summary)
+          echo "::notice title=Application Deployed::Access your app here: $URL"
+          
+          # 2. Output a Job Summary (Markdown)
+          echo "### 🚀 LeakyBucket Shop Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "You can access the vulnerable application here:" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **[$URL]($URL)**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> *Note: It may take a few minutes for the DNS to propagate.*" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "::warning::Load Balancer is still provisioning. Check AWS Console or run 'kubectl get svc' later."
+        fi

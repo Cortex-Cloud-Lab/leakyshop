@@ -57,7 +57,7 @@ jobs:
     # PATH A: DESTROY (TEARDOWN)
     # =========================================================
 
-    # --- NEW PRE-DESTROY CLEANUP STEP ---
+    # --- PRE-DESTROY CLEANUP STEP (CRITICAL FOR IGW/VPC) ---
     - name: Pre-Destroy: Delete Kubernetes Load Balancers
       if: env.TF_ACTION == 'destroy'
       env:

@@ -12,8 +12,8 @@ terraform {
 
 provider "aws" {
   region     = "us-east-1"
-  access_key = "AKIAEXAMPLEACCESSKEY" 
-  secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  #access_key = "AKIAEXAMPLEACCESSKEY" 
+  #secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 }
 
 # --- NETWORK ---

@@ -13,8 +13,8 @@ on:
         - apply
         - destroy
   # Default fallback for git push
-  #push:
-    #branches: [ "main" ]
+  push:
+    branches: [ "main" ]
 
 jobs:
   manage-infrastructure:
@@ -56,6 +56,45 @@ jobs:
     # =========================================================
     # PATH A: DESTROY (TEARDOWN)
     # =========================================================
+
+    # --- NEW PRE-DESTROY CLEANUP STEP ---
+    - name: Pre-Destroy: Delete Kubernetes Load Balancers
+      if: env.TF_ACTION == 'destroy'
+      env:
+        CLUSTER_NAME: leaky-cluster
+      run: |
+        echo "Attempting to find and delete residual Kubernetes Load Balancers..."
+        
+        # 1. Update kubeconfig to enable kubectl commands
+        aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1 || { 
+          echo "Warning: Could not update kubeconfig. Cluster may already be gone."
+        }
+        
+        # 2. Get the hostname from the Service (this is the load balancer DNS)
+        LB_DNS=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        
+        if [ -z "$LB_DNS" ]; then
+          echo "No Load Balancer DNS found for leaky-bucket-service. Continuing destroy."
+        else
+          # Extract the Load Balancer name from the DNS (first part of the FQDN)
+          LB_NAME=$(echo "$LB_DNS" | cut -d'.' -f1)
+          echo "Found Load Balancer Hostname: $LB_DNS"
+          
+          # 3. Check if it's a classic ELB
+          LB_ARN=$(aws elb describe-load-balancers --load-balancer-names "$LB_NAME" --query 'LoadBalancerDescriptions[0].LoadBalancerName' --output text 2>/dev/null || true)
+          
+          if [ "$LB_ARN" != "None" ] && [ -n "$LB_ARN" ]; then
+             echo "Deleting Classic Load Balancer: $LB_NAME"
+             # 4. Delete the Classic ELB (This will clean up the ENIs, unblocking the IGW/VPC)
+             aws elb delete-load-balancer --load-balancer-name "$LB_NAME"
+             echo "Load Balancer deletion initiated. Wait for 60s for cleanup..."
+             sleep 60
+          else
+             echo "Load Balancer $LB_NAME not found via classic ELB endpoint. Continuing..."
+          fi
+        fi
+
+    # 1. Destroy App Layer
     - name: Restore App State (For Destroy)
       if: env.TF_ACTION == 'destroy'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No state found, skipping..."
@@ -71,6 +110,7 @@ jobs:
       if: env.TF_ACTION == 'destroy' && always()
       run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate || echo "Bucket might be gone, skipping upload"
 
+    # 2. Destroy Setup Layer
     - name: Restore Setup State (For Destroy)
       if: env.TF_ACTION == 'destroy'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No state found, skipping..."
@@ -102,7 +142,7 @@ jobs:
       if: env.TF_ACTION == 'apply' && always()
       run: aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
 
-    # 2. Build & Prepare Artifacts
+    # 2. Build Artifacts
     - name: Backup Env to S3
       if: env.TF_ACTION == 'apply'
       run: |
@@ -116,7 +156,6 @@ jobs:
         echo "Running Unit Tests..."
         cd backend
         npm install
-        # VULNERABILITY: Pipeline configured to continue even if tests fail (|| true)
         npm test || echo "Tests failed, but continuing deployment..."
 
     # --- FRONTEND BUILD ---
@@ -197,7 +236,7 @@ jobs:
           if [ -n "$address" ]; then
             echo "Load Balancer Address found: $address"
             break
-          fi
+          }
           echo "Waiting for External IP/Hostname... ($i/30)"
           sleep 10
         done

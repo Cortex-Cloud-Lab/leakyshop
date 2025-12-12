@@ -1,7 +1,6 @@
 name: LeakyBucket Infrastructure
 
 on:
-  # Manual Trigger with options
   workflow_dispatch:
     inputs:
       action:
@@ -12,9 +11,9 @@ on:
         options:
           - apply
           - destroy
-  # Default fallback for git push
-  push:
-    branches: [ "main" ]
+  #push:
+    #branches:
+      #- main
 
 jobs:
   manage-infrastructure:
@@ -27,7 +26,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # 1. DETERMINE ACTION
       - name: Set Action Variable
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then

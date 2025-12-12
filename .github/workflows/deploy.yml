@@ -109,7 +109,7 @@ jobs:
         env > .env
         aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
 
-    # --- NEW: UNIT TESTS ---
+    # --- UNIT TESTS ---
     - name: Run Backend Unit Tests
       if: env.TF_ACTION == 'apply'
       run: |
@@ -119,15 +119,18 @@ jobs:
         # VULNERABILITY: Pipeline configured to continue even if tests fail (|| true)
         npm test || echo "Tests failed, but continuing deployment..."
 
+    # --- FRONTEND BUILD ---
     - name: Build and Prepare Frontend
       if: env.TF_ACTION == 'apply'
       env:
         CI: false
         NODE_OPTIONS: --openssl-legacy-provider
       run: |
+        echo "Building Frontend..."
         cd frontend
         npm install
         npm run build
+        echo "Moving frontend build to backend public folder..."
         mkdir -p ../backend/public
         cp -r build/* ../backend/public/
 
@@ -183,6 +186,9 @@ jobs:
         
         kubectl apply -f kubernetes/leaky-app.yaml
         
+        # --- FORCE RESTART ---
+        kubectl rollout restart deployment/leaky-bucket-app
+        
         # Wait for LoadBalancer and Output URL
         echo "Waiting for Load Balancer provisioning..."
         address=""
@@ -198,7 +204,7 @@ jobs:
 
         if [ -n "$address" ]; then
           URL="http://$address"
-          # Export URL to environment variable for the next step (Smoke Tests)
+          # Export URL for next step
           echo "DEPLOYED_URL=$URL" >> $GITHUB_ENV
           
           echo "::notice title=Application Deployed::Access your app here: $URL"
@@ -209,7 +215,7 @@ jobs:
           echo "::warning::Load Balancer is still provisioning."
         fi
 
-    # --- NEW: SMOKE TESTS ---
+    # --- SMOKE TESTS ---
     - name: Run Post-Deployment Smoke Tests
       if: env.TF_ACTION == 'apply' && env.DEPLOYED_URL != ''
       run: |
@@ -225,5 +231,4 @@ jobs:
         else
           echo "⚠️ Smoke Test Warning: Application returned HTTP $response"
           echo "This may be due to DNS propagation delay. Please check the URL manually later."
-          # We do not exit 1 here to ensure the pipeline finishes green for the lab
         fi

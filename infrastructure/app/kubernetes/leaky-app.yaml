@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaky-bucket-app
+  labels:
+    app: leaky-bucket-shop
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: leaky-bucket-shop
+  template:
+    metadata:
+      labels:
+        app: leaky-bucket-shop
+    spec:
+      containers:
+      - name: leaky-bucket-app
+        # PLACEHOLDER: The CI/CD pipeline will replace this with the actual ECR URL
+        image: REPLACE_WITH_ECR_IMAGE_URL
+        ports:
+        - containerPort: 3000
+        env:
+        # VULNERABILITY: Hardcoded DB credentials in plain text env vars
+        - name: DB_HOST
+          # PLACEHOLDER: The CI/CD pipeline will replace this with the Terraform Output
+          value: "REPLACE_WITH_RDS_ENDPOINT"
+        - name: DB_PASSWORD
+          value: "password123"
+        securityContext:
+          # VULNERABILITY: Running as privileged root
+          privileged: true 
+          runAsUser: 0
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: leaky-bucket-service
+spec:
+  type: LoadBalancer # Expose to the internet
+  selector:
+    app: leaky-bucket-shop
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000

@@ -10,7 +10,7 @@ This application contains intentional **Critical Severity** vulnerabilities. It 
 
 ## System Architecture
 
-This application simulates a modern, cloud-native e-commerce platform that has been "shifted left" without security controls.
+The application follows a "Shift Left" vulnerability model. The infrastructure is provisioned in two stages (Setup & App), and the runtime uses a single container to serve both the API and the Frontend.
 
 ### Architectural Diagram
 
@@ -21,42 +21,42 @@ graph TD
     Internet((Public Internet))
     
     subgraph "CI/CD (GitHub Actions)"
-        Pipeline[Build & Deploy]
+        Pipeline[Deploy Workflow]
     end
 
     subgraph "AWS Region (us-east-1)"
-        ECR[("ECR Registry\n(Mutable Tags)")]
-        
-        subgraph "VPC: leaky-vpc"
-            subgraph "Public Subnets (10.0.1.0/24, 10.0.2.0/24)"
-                EKS_API[("EKS API Server\n(Public Endpoint)")]
-                
-                subgraph "EKS Cluster: leaky-cluster"
-                    Node[("Worker Nodes\n(SSH Open 0.0.0.0/0)")]
-                    Pod[("Backend Container\n(Root User)")]
-                end
-                
-                RDS[("RDS Postgres\n(Publicly Accessible)")]
-            end
+        subgraph "Setup Resources"
+            S3[("S3 Bucket\n(Public Read/Write)")]
+            ECR[("ECR Registry\n(Mutable Tags)")]
         end
         
-        S3[("S3 Bucket\n(Public Read/Write)")]
+        subgraph "VPC: leaky-vpc"
+            subgraph "Public Subnets"
+                LB[("Classic Load Balancer")]
+                
+                subgraph "EKS Cluster: leaky-cluster"
+                    Pod[("App Pod\n(Node.js API + React Static)")]
+                end
+                
+                RDS[("RDS Postgres 16.3\n(Publicly Accessible)")]
+            end
+        end
     end
 
-    %% Flows
-    Pipeline -- "1. Leak Env Vars" --> S3
-    Pipeline -- "2. Push Unscanned Image" --> ECR
-    Pipeline -- "3. Terraform Apply" --> EKS_API
-    
-    Node -- "Pull Image" --> ECR
-    Pod -- "Read/Write" --> RDS
-    Pod -- "RCE / File Upload" --> Pod
+    %% CI/CD Flows
+    Pipeline -- "1. Read/Write TF State" --> S3
+    Pipeline -- "2. Leak .env File" --> S3
+    Pipeline -- "3. Push Image" --> ECR
+    Pipeline -- "4. Deploy Manifests" --> Pod
+
+    %% Application Flows
+    Internet -- "HTTP:80" --> LB
+    LB -- "HTTP:3000" --> Pod
+    Pod -- "DB Connection (cortexcloudadmin)" --> RDS
     
     %% Vulnerabilities
     Internet -- "Direct SQL Access" --- RDS
-    Internet -- "Direct K8s API Access" --- EKS_API
-    Internet -- "SSH Access" --- Node
-    Internet -- "Access Leaked Env/Assets" --- S3
+    Internet -- "Access Leaked Env/State" --- S3
 ```
 
 ### Dataflow Diagram
@@ -65,28 +65,35 @@ This diagram illustrates how data flows through the application during a user re
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Attacker
-    participant Front as Frontend (React)
-    participant API as Backend (Node.js)
-    participant DB as RDS (Postgres)
-    participant S3 as S3 (Public)
+    participant Dev as GitHub Actions
+    participant S3 as S3 Bucket
+    participant ECR as ECR Registry
+    participant K8s as EKS Cluster
+    participant User as User/Attacker
+    participant DB as RDS Database
 
-    Note over Attacker, S3: Scenario: Remote Code Execution & Data Exfiltration
+    box "Runtime Environment"
+        K8s
+        DB
+    end
 
-    Attacker->>API: POST /api/admin/system (Command Injection)
-    Note right of Attacker: Payload: "cat /etc/passwd"
-    API-->>Attacker: Returns /etc/passwd content
+    Note over Dev, K8s: Phase 1: Deployment & State Management
+    Dev->>S3: Download Terraform State (setup.tfstate / app.tfstate)
+    Dev->>S3: Upload .env backup (Credentials Leaked!)
+    Dev->>ECR: Push Docker Image (Node + React)
+    Dev->>K8s: Apply Manifests & Restart Deployment
+    Dev->>S3: Upload updated Terraform State
+
+    Note over User, DB: Phase 2: Runtime & Attack Surface
+    User->>K8s: GET / (Loads React Frontend)
+    User->>K8s: POST /api/login (SQL Injection payload)
+    K8s->>DB: SELECT * FROM users WHERE ... (Malicious Query)
+    DB-->>K8s: Dumps User Table
+    K8s-->>User: Returns Sensitive Data
     
-    Attacker->>API: POST /api/upload (Unrestricted Upload)
-    Note right of Attacker: Uploads webshell.php
-    API-->>Attacker: "File saved to /tmp/webshell.php"
-
-    Attacker->>DB: Direct Connection (Port 5432)
-    Note right of Attacker: Uses hardcoded creds found in GitHub
-    DB-->>Attacker: Dumps 'users' table
-
-    Attacker->>S3: GET /debug_env.txt
-    S3-->>Attacker: Returns AWS Keys & DB Passwords
+    Note right of User: Attack: S3 Reconnaissance
+    User->>S3: GET /debug_env.txt
+    S3-->>User: Returns AWS Keys & DB Passwords
 ```
 ### Deployment Instructions
 
@@ -96,14 +103,17 @@ sequenceDiagram
 * Docker installed
 * Node.js installed
 
-#### 1. Provision Infrastructure
-The infrastructure is split into logical files but shares a common insecure state.
+### 1. Deploy via GitHub Actions Workflow
 
-```bash
-cd infrastructure
-terraform init
-terraform apply -auto-approve
-```
+The entire infrastructure provisioning and application deployment are handled by the `deploy.yml` workflow, triggered manually via `workflow_dispatch`.
+
+1.  **Navigate to Actions:** Go to the "Actions" tab in your GitHub repository.
+2.  **Select Workflow:** Click on the "LeakyBucket Infrastructure" workflow in the left sidebar.
+3.  **Run Workflow:** Click the "Run workflow" button on the right.
+4.  **Choose Action:** Select the action you want to perform:
+    * **`apply` (Default):** Provisions/updates the AWS resources (EKS, RDS, S3) and deploys the application code.
+    * **`destroy`:** Tears down all the infrastructure (EKS, RDS, etc.) in reverse order.
+5.  **Monitor:** Once the job completes, check the "Deploy to EKS" step output or the job summary for the final application URL.
 
 #### 2. Build & Deploy Application
 (In a real scenario, the GitHub Action handles this, but you can run locally to simulate the build process)

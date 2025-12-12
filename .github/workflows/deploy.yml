@@ -1,6 +1,7 @@
 name: LeakyBucket Infrastructure
 
 on:
+  # Manual Trigger with options
   workflow_dispatch:
     inputs:
       action:
@@ -9,11 +10,11 @@ on:
         default: 'apply'
         type: choice
         options:
-          - apply
-          - destroy
+        - apply
+        - destroy
+  # Default fallback for git push
   #push:
-    #branches:
-      #- main
+    #branches: [ "main" ]
 
 jobs:
   manage-infrastructure:
@@ -23,202 +24,250 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+    - uses: actions/checkout@v3
 
-      - name: Set Action Variable
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "TF_ACTION=${{ github.event.inputs.action }}" >> $GITHUB_ENV
+    # 1. DETERMINE ACTION
+    - name: Set Action Variable
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "TF_ACTION=${{ github.event.inputs.action }}" >> $GITHUB_ENV
+        else
+          echo "TF_ACTION=apply" >> $GITHUB_ENV
+        fi
+
+    # 2. STANDARD SETUP
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.7
+        terraform_wrapper: false
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Get AWS Account ID
+      id: creds
+      run: echo "aws_account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+    # =========================================================
+    # PATH A: DESTROY (TEARDOWN)
+    # =========================================================
+
+    # --- PRE-DESTROY CLEANUP STEP (CRITICAL FOR IGW/VPC) ---
+    - name: Pre-Destroy - Delete Kubernetes Load Balancers
+      if: env.TF_ACTION == 'destroy'
+      env:
+        CLUSTER_NAME: leaky-cluster
+      run: |
+        echo "Attempting to find and delete residual Kubernetes Load Balancers..."
+        
+        # 1. Update kubeconfig to enable kubectl commands
+        aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1 || { 
+          echo "Warning: Could not update kubeconfig. Cluster may already be gone."
+        }
+        
+        # 2. Get the hostname from the Service (this is the load balancer DNS)
+        LB_DNS=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+        
+        if [ -z "$LB_DNS" ]; then
+          echo "No Load Balancer DNS found for leaky-bucket-service. Continuing destroy."
+        else
+          # Extract the Load Balancer name from the DNS (first part of the FQDN)
+          LB_NAME=$(echo "$LB_DNS" | cut -d'.' -f1)
+          echo "Found Load Balancer Hostname: $LB_DNS"
+          
+          # 3. Check if it's a classic ELB
+          LB_ARN=$(aws elb describe-load-balancers --load-balancer-names "$LB_NAME" --query 'LoadBalancerDescriptions[0].LoadBalancerName' --output text 2>/dev/null || true)
+          
+          if [ "$LB_ARN" != "None" ] && [ -n "$LB_ARN" ]; then
+             echo "Deleting Classic Load Balancer: $LB_NAME"
+             # 4. Delete the Classic ELB (This will clean up the ENIs, unblocking the IGW/VPC)
+             aws elb delete-load-balancer --load-balancer-name "$LB_NAME"
+             echo "Load Balancer deletion initiated. Wait for 60s for cleanup..."
+             sleep 60
           else
-            echo "TF_ACTION=apply" >> $GITHUB_ENV
+             echo "Load Balancer $LB_NAME not found via classic ELB endpoint. Continuing..."
           fi
+        fi
 
-      # 2. STANDARD SETUP
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.7
-          terraform_wrapper: false
+    # 1. Destroy App Layer
+    - name: Restore App State (For Destroy)
+      if: env.TF_ACTION == 'destroy'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No state found, skipping..."
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+    - name: Terraform Destroy (App)
+      if: env.TF_ACTION == 'destroy'
+      run: |
+        cd infrastructure/app
+        terraform init
+        terraform destroy -auto-approve
 
-      - name: Get AWS Account ID
-        id: creds
-        run: echo "aws_account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+    - name: Update App State (Post-Destroy)
+      if: env.TF_ACTION == 'destroy' && always()
+      run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate || echo "Bucket might be gone, skipping upload"
 
-      # =========================================================
-      # PATH A: DESTROY (TEARDOWN)
-      # =========================================================
+    # 2. Destroy Setup Layer
+    - name: Restore Setup State (For Destroy)
+      if: env.TF_ACTION == 'destroy'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No state found, skipping..."
 
-      - name: Pre-Destroy: Delete Kubernetes Load Balancers
-        if: env.TF_ACTION == 'destroy'
-        env:
-          CLUSTER_NAME: leaky-cluster
-        run: |
-          echo "Attempting to find and delete residual Kubernetes Load Balancers..."
-          aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1 || { 
-            echo "Warning: Could not update kubeconfig. Cluster may already be gone."
-          }
-          
-          LB_DNS=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-          
-          if [ -z "$LB_DNS" ]; then
-            echo "No Load Balancer DNS found. Continuing destroy."
-          else
-            LB_NAME=$(echo "$LB_DNS" | cut -d'.' -f1)
-            LB_ARN=$(aws elb describe-load-balancers --load-balancer-names "$LB_NAME" --query 'LoadBalancerDescriptions[0].LoadBalancerName' --output text 2>/dev/null || true)
-            
-            if [ "$LB_ARN" != "None" ] && [ -n "$LB_ARN" ]; then
-               aws elb delete-load-balancer --load-balancer-name "$LB_NAME"
-               sleep 60
-            fi
-          fi
+    - name: Terraform Destroy (Setup)
+      if: env.TF_ACTION == 'destroy'
+      run: |
+        cd infrastructure/setup
+        terraform init
+        terraform destroy -auto-approve
 
-      - name: Restore App State (For Destroy)
-        if: env.TF_ACTION == 'destroy'
-        run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No state found..."
+    # =========================================================
+    # PATH B: APPLY (CREATE/UPDATE)
+    # =========================================================
 
-      - name: Terraform Destroy (App)
-        if: env.TF_ACTION == 'destroy'
-        run: |
-          cd infrastructure/app
-          terraform init
-          terraform destroy -auto-approve
+    # 1. Setup Layer
+    - name: Restore Setup State (For Apply)
+      if: env.TF_ACTION == 'apply'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No remote state found (fresh install)"
 
-      - name: Update App State (Post-Destroy)
-        if: env.TF_ACTION == 'destroy' && always()
-        run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate || echo "Upload failed"
+    - name: Terraform Apply (Setup)
+      if: env.TF_ACTION == 'apply'
+      run: |
+        cd infrastructure/setup
+        terraform init
+        terraform apply -auto-approve
 
-      - name: Restore Setup State (For Destroy)
-        if: env.TF_ACTION == 'destroy'
-        run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No state found..."
+    - name: Persist Setup State
+      if: env.TF_ACTION == 'apply' && always()
+      run: aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
 
-      - name: Terraform Destroy (Setup)
-        if: env.TF_ACTION == 'destroy'
-        run: |
-          cd infrastructure/setup
-          terraform init
-          terraform destroy -auto-approve
+    # 2. Build Artifacts
+    - name: Backup Env to S3
+      if: env.TF_ACTION == 'apply'
+      run: |
+        env > .env
+        aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
 
-      # =========================================================
-      # PATH B: APPLY (CREATE/UPDATE)
-      # =========================================================
+    # --- UNIT TESTS ---
+    - name: Run Backend Unit Tests
+      if: env.TF_ACTION == 'apply'
+      run: |
+        echo "Running Unit Tests..."
+        cd backend
+        npm install
+        npm test || echo "Tests failed, but continuing deployment..."
 
-      - name: Restore Setup State (For Apply)
-        if: env.TF_ACTION == 'apply'
-        run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "Fresh install"
+    # --- FRONTEND BUILD ---
+    - name: Build and Prepare Frontend
+      if: env.TF_ACTION == 'apply'
+      env:
+        CI: false
+        NODE_OPTIONS: --openssl-legacy-provider
+      run: |
+        echo "Building Frontend..."
+        cd frontend
+        npm install
+        npm run build
+        echo "Moving frontend build to backend public folder..."
+        mkdir -p ../backend/public
+        cp -r build/* ../backend/public/
 
-      - name: Terraform Apply (Setup)
-        if: env.TF_ACTION == 'apply'
-        run: |
-          cd infrastructure/setup
-          terraform init
-          terraform apply -auto-approve
+    - name: Login to Amazon ECR
+      if: env.TF_ACTION == 'apply'
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Persist Setup State
-        if: env.TF_ACTION == 'apply' && always()
-        run: aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
+    - name: Build and Push Docker Image
+      if: env.TF_ACTION == 'apply'
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: leaky-bucket-repo
+        IMAGE_TAG: latest
+      run: |
+        cd backend
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      - name: Backup Env to S3
-        if: env.TF_ACTION == 'apply'
-        run: |
-          env > .env
-          aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
+    # 3. App Layer
+    - name: Restore App State (For Apply)
+      if: env.TF_ACTION == 'apply'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No remote app state found"
 
-      - name: Run Backend Unit Tests
-        if: env.TF_ACTION == 'apply'
-        run: |
-          cd backend
-          npm install
-          npm test || echo "Tests failed, continuing..."
+    - name: Terraform Apply (App)
+      if: env.TF_ACTION == 'apply'
+      run: |
+        cd infrastructure/app
+        terraform init
+        terraform apply -auto-approve
 
-      - name: Build and Prepare Frontend
-        if: env.TF_ACTION == 'apply'
-        env:
-          CI: false
-          NODE_OPTIONS: --openssl-legacy-provider
-        run: |
-          cd frontend
-          npm install
-          npm run build
-          mkdir -p ../backend/public
-          cp -r build/* ../backend/public/
+    - name: Persist App State
+      if: env.TF_ACTION == 'apply' && always()
+      run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate
 
-      - name: Login to Amazon ECR
-        if: env.TF_ACTION == 'apply'
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+    # 4. Kubernetes Deployment
+    - name: Deploy to EKS
+      if: env.TF_ACTION == 'apply'
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: leaky-bucket-repo
+        IMAGE_TAG: latest
+        CLUSTER_NAME: leaky-cluster
+      run: |
+        cd infrastructure/app
+        RDS_ENDPOINT=$(terraform output -raw db_endpoint)
+        cd ../..
 
-      - name: Build and Push Docker Image
-        if: env.TF_ACTION == 'apply'
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: leaky-bucket-repo
-          IMAGE_TAG: latest
-        run: |
-          cd backend
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-      - name: Restore App State (For Apply)
-        if: env.TF_ACTION == 'apply'
-        run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No remote app state found"
-
-      - name: Terraform Apply (App)
-        if: env.TF_ACTION == 'apply'
-        run: |
-          cd infrastructure/app
-          terraform init
-          terraform apply -auto-approve
-
-      - name: Persist App State
-        if: env.TF_ACTION == 'apply' && always()
-        run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate
-
-      - name: Deploy to EKS
-        if: env.TF_ACTION == 'apply'
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: leaky-bucket-repo
-          IMAGE_TAG: latest
-          CLUSTER_NAME: leaky-cluster
-        run: |
-          cd infrastructure/app
-          RDS_ENDPOINT=$(terraform output -raw db_endpoint)
-          cd ../..
-          aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
-          sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
-          sed -i "s|REPLACE_WITH_RDS_ENDPOINT|$RDS_ENDPOINT|g" kubernetes/leaky-app.yaml
-          kubectl apply -f kubernetes/leaky-app.yaml
-          kubectl rollout restart deployment/leaky-bucket-app
-          
-          address=""
-          for i in {1..30}; do
-            address=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            if [ -n "$address" ]; then break; fi
-            sleep 10
-          done
-
+        aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
+        
+        sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
+        sed -i "s|REPLACE_WITH_RDS_ENDPOINT|$RDS_ENDPOINT|g" kubernetes/leaky-app.yaml
+        
+        kubectl apply -f kubernetes/leaky-app.yaml
+        
+        # --- FORCE RESTART ---
+        kubectl rollout restart deployment/leaky-bucket-app
+        
+        # Wait for LoadBalancer and Output URL
+        echo "Waiting for Load Balancer provisioning..."
+        address=""
+        for i in {1..30}; do
+          address=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
           if [ -n "$address" ]; then
-            URL="http://$address"
-            echo "DEPLOYED_URL=$URL" >> $GITHUB_ENV
-            echo "### 🚀 LeakyBucket Shop Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
-            echo "🔗 **[$URL]($URL)**" >> $GITHUB_STEP_SUMMARY
+            echo "Load Balancer Address found: $address"
+            break
           fi
+          echo "Waiting for External IP/Hostname... ($i/30)"
+          sleep 10
+        done
 
-      - name: Run Post-Deployment Smoke Tests
-        if: env.TF_ACTION == 'apply' && env.DEPLOYED_URL != ''
-        run: |
-          sleep 30
-          response=$(curl --write-out "%{http_code}\n" --silent --output /dev/null "${{ env.DEPLOYED_URL }}")
-          if [ "$response" == "200" ]; then
-            echo "✅ Smoke Test Passed"
-          else
-            echo "⚠️ Smoke Test Warning: HTTP $response"
-          fi
+        if [ -n "$address" ]; then
+          URL="http://$address"
+          # Export URL for next step
+          echo "DEPLOYED_URL=$URL" >> $GITHUB_ENV
+          
+          echo "::notice title=Application Deployed::Access your app here: $URL"
+          echo "### 🚀 LeakyBucket Shop Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "You can access the vulnerable application here:" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **[$URL]($URL)**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "::warning::Load Balancer is still provisioning."
+        fi
+
+    # --- SMOKE TESTS ---
+    - name: Run Post-Deployment Smoke Tests
+      if: env.TF_ACTION == 'apply' && env.DEPLOYED_URL != ''
+      run: |
+        echo "Running smoke tests against: ${{ env.DEPLOYED_URL }}"
+        echo "Waiting 30s for DNS propagation..."
+        sleep 30
+        
+        # Attempt to curl the endpoint
+        response=$(curl --write-out "%{http_code}\n" --silent --output /dev/null "${{ env.DEPLOYED_URL }}")
+        
+        if [ "$response" == "200" ]; then
+          echo "✅ Smoke Test Passed: Application is responding with HTTP 200"
+        else
+          echo "⚠️ Smoke Test Warning: Application returned HTTP $response"
+          echo "This may be due to DNS propagation delay. Please check the URL manually later."
+        fi

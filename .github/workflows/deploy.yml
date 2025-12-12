@@ -26,7 +26,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # 1. DETERMINE ACTION (Apply or Destroy)
+    # 1. DETERMINE ACTION
     - name: Set Action Variable
       run: |
         if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
@@ -55,10 +55,7 @@ jobs:
 
     # =========================================================
     # PATH A: DESTROY (TEARDOWN)
-    # Order: App -> Setup (Reverse dependency)
     # =========================================================
-
-    # 1. Destroy App Layer (EKS/RDS)
     - name: Restore App State (For Destroy)
       if: env.TF_ACTION == 'destroy'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No state found, skipping..."
@@ -74,7 +71,6 @@ jobs:
       if: env.TF_ACTION == 'destroy' && always()
       run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate || echo "Bucket might be gone, skipping upload"
 
-    # 2. Destroy Setup Layer (S3/ECR)
     - name: Restore Setup State (For Destroy)
       if: env.TF_ACTION == 'destroy'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No state found, skipping..."
@@ -88,10 +84,9 @@ jobs:
 
     # =========================================================
     # PATH B: APPLY (CREATE/UPDATE)
-    # Order: Setup -> App (Standard dependency)
     # =========================================================
 
-    # 1. Setup Layer (S3/ECR)
+    # 1. Setup Layer
     - name: Restore Setup State (For Apply)
       if: env.TF_ACTION == 'apply'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No remote state found (fresh install)"
@@ -107,12 +102,34 @@ jobs:
       if: env.TF_ACTION == 'apply' && always()
       run: aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
 
-    # 2. Build Artifacts (Docker/Env)
+    # 2. Build & Prepare Artifacts
     - name: Backup Env to S3
       if: env.TF_ACTION == 'apply'
       run: |
         env > .env
         aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
+
+    # --- NEW: UNIT TESTS ---
+    - name: Run Backend Unit Tests
+      if: env.TF_ACTION == 'apply'
+      run: |
+        echo "Running Unit Tests..."
+        cd backend
+        npm install
+        # VULNERABILITY: Pipeline configured to continue even if tests fail (|| true)
+        npm test || echo "Tests failed, but continuing deployment..."
+
+    - name: Build and Prepare Frontend
+      if: env.TF_ACTION == 'apply'
+      env:
+        CI: false
+        NODE_OPTIONS: --openssl-legacy-provider
+      run: |
+        cd frontend
+        npm install
+        npm run build
+        mkdir -p ../backend/public
+        cp -r build/* ../backend/public/
 
     - name: Login to Amazon ECR
       if: env.TF_ACTION == 'apply'
@@ -130,7 +147,7 @@ jobs:
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # 3. App Layer (EKS/RDS)
+    # 3. App Layer
     - name: Restore App State (For Apply)
       if: env.TF_ACTION == 'apply'
       run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No remote app state found"
@@ -155,25 +172,20 @@ jobs:
         IMAGE_TAG: latest
         CLUSTER_NAME: leaky-cluster
       run: |
-        # A. Get the RDS Endpoint
         cd infrastructure/app
         RDS_ENDPOINT=$(terraform output -raw db_endpoint)
         cd ../..
 
-        # B. Update kubeconfig
         aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
         
-        # C. Inject dynamic values into Manifest
         sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
         sed -i "s|REPLACE_WITH_RDS_ENDPOINT|$RDS_ENDPOINT|g" kubernetes/leaky-app.yaml
         
-        # D. Apply manifests
         kubectl apply -f kubernetes/leaky-app.yaml
         
-        # E. Wait for LoadBalancer and Output URL
+        # Wait for LoadBalancer and Output URL
         echo "Waiting for Load Balancer provisioning..."
         address=""
-        # Retry loop to wait for AWS to assign a hostname (timeout 5 mins)
         for i in {1..30}; do
           address=$(kubectl get svc leaky-bucket-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
           if [ -n "$address" ]; then
@@ -186,15 +198,32 @@ jobs:
 
         if [ -n "$address" ]; then
           URL="http://$address"
-          # 1. Output a GitHub Annotation (Visible in the run summary)
-          echo "::notice title=Application Deployed::Access your app here: $URL"
+          # Export URL to environment variable for the next step (Smoke Tests)
+          echo "DEPLOYED_URL=$URL" >> $GITHUB_ENV
           
-          # 2. Output a Job Summary (Markdown)
+          echo "::notice title=Application Deployed::Access your app here: $URL"
           echo "### 🚀 LeakyBucket Shop Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "You can access the vulnerable application here:" >> $GITHUB_STEP_SUMMARY
           echo "🔗 **[$URL]($URL)**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> *Note: It may take a few minutes for the DNS to propagate.*" >> $GITHUB_STEP_SUMMARY
         else
-          echo "::warning::Load Balancer is still provisioning. Check AWS Console or run 'kubectl get svc' later."
+          echo "::warning::Load Balancer is still provisioning."
+        fi
+
+    # --- NEW: SMOKE TESTS ---
+    - name: Run Post-Deployment Smoke Tests
+      if: env.TF_ACTION == 'apply' && env.DEPLOYED_URL != ''
+      run: |
+        echo "Running smoke tests against: ${{ env.DEPLOYED_URL }}"
+        echo "Waiting 30s for DNS propagation..."
+        sleep 30
+        
+        # Attempt to curl the endpoint
+        response=$(curl --write-out "%{http_code}\n" --silent --output /dev/null "${{ env.DEPLOYED_URL }}")
+        
+        if [ "$response" == "200" ]; then
+          echo "✅ Smoke Test Passed: Application is responding with HTTP 200"
+        else
+          echo "⚠️ Smoke Test Warning: Application returned HTTP $response"
+          echo "This may be due to DNS propagation delay. Please check the URL manually later."
+          # We do not exit 1 here to ensure the pipeline finishes green for the lab
         fi

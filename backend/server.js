@@ -4,9 +4,16 @@ const pg = require('pg');
 const jwt = require('jsonwebtoken');
 const multer = require('multer'); 
 const { exec } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
 const app = express();
 
 app.use(bodyParser.json());
+
+// --- SERVE FRONTEND STATIC FILES ---
+// This tells Express to look for files in the 'public' folder
+app.use(express.static(path.join(__dirname, 'public')));
 
 const JWT_SECRET = 'secret_key_12345'; // Hardcoded Secret
 
@@ -50,6 +57,17 @@ app.post('/api/login', async (req, res) => {
     return res.json({ success: true, token: token });
   }
   res.status(401).send('Invalid credentials');
+});
+
+// --- CATCH-ALL ROUTE ---
+// If the user goes to /, serve the React App.
+app.get('*', (req, res) => {
+  const indexPath = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.send('<h1>LeakyBucket API is running</h1><p>Frontend assets not found in /public.</p>');
+  }
 });
 
 app.listen(3000, () => {

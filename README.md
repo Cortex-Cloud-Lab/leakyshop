@@ -1,5 +1,3 @@
-- [LEX5 Tenant](https://lex5.xdr.us.paloaltonetworks.com/)
-
 # 🛒 LeakyBucket Shop - CNAPP Training Lab
 
 **WARNING: DO NOT DEPLOY THIS TO A PRODUCTION ACCOUNT.**
